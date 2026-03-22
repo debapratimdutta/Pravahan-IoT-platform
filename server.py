@@ -192,8 +192,8 @@ async def writeFields(
         if val is not None and i < len(fields):
             fields[i]["value"] = val
 
-    if time_src != None:
-        fields[6]["value"] = time.time_ns()/1000000
+    #if time_src != None:
+    fields[6]["value"] = time.time_ns()/1000000
     
     saveChannels()
 
