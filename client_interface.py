@@ -7,6 +7,9 @@ import string
 import os
 import subprocess
 from pathlib import Path
+from datetime import datetime
+import tkinter as tk
+from tkinter import filedialog
 
 # ────────────────────────────────────────────────
 # Config
@@ -18,6 +21,7 @@ API_BASE_URL = ""
 READ_INTERVAL_SEC = 0.1
 SERVER_RETRY_INTERVAL = 5
 KEEP_NEWEST_IMAGES = 20
+MAX_EXPORT_ROWS = 200
 
 # API path templates
 CHANNELS_LIST     = ":8000/channels"
@@ -27,6 +31,7 @@ FIELDS_WRITE      = ":8000/writeFields?id=[id]"
 FIELDS_READ       = ":8000/readFields?id=[id]"
 IMAGES_LIST       = ":8000/listImages?id=[id]&results=[results]"
 IMAGES_GET        = ":8000/getImages?id=[id]&results=[results]"
+FETCH_DATA        = ":8000/fetchData?id=[id]&results=[results]"
 
 # State
 channels_data = {}
@@ -113,6 +118,30 @@ def parse_multipart(resp):
     return result
 
 
+def cleanup_stale_channel_folders():
+    """Remove client_media folders for channels that no longer exist on server"""
+    if not CLIENT_MEDIA_DIR.exists():
+        return
+
+    known_ids = set(channels_data.keys())
+
+    for item in CLIENT_MEDIA_DIR.iterdir():
+        if item.is_dir() and item.name not in known_ids:
+            try:
+                # recursive delete
+                import shutil
+                shutil.rmtree(item)
+                print(f"Removed stale channel folder: {item.name}")
+            except Exception as e:
+                print(f"Failed to remove stale folder {item.name}: {e}")
+
+
+def create_missing_channel_folders():
+    """Create client_media/<id> folders for newly discovered channels"""
+    for cid in channels_data:
+        ensure_channel_dir(cid)
+
+
 # ────────────────────────────────────────────────
 # Connection
 # ────────────────────────────────────────────────
@@ -154,6 +183,8 @@ def load_dashboard(data):
     global channels_data
     channels_data = data.get("channels", {})
     CLIENT_MEDIA_DIR.mkdir(exist_ok=True)
+    cleanup_stale_channel_folders()
+    create_missing_channel_folders()
     dpg.show_item("dashboard")
     refresh_channel_list()
 
@@ -217,8 +248,10 @@ def select_channel(sender, app_data, channel_id):
         dpg.add_button(label="Close channel", callback=close_channel)
         dpg.add_spacer(width=12)
         dpg.add_button(label="Open channel images", callback=open_channel_images_folder)
+        dpg.add_spacer(width=12)
+        dpg.add_button(label="Export data", callback=open_export_popup)
 
-    # Latency test - using plain requests.get() without timeout on write
+    # Latency test ...
     latency_list = []
     write_base = base + FIELDS_WRITE.replace("[id]", selected_channel_id)
 
@@ -251,6 +284,68 @@ def open_channel_images_folder():
     if selected_channel_id:
         open_in_explorer(CLIENT_MEDIA_DIR / selected_channel_id)
 
+
+def open_export_popup():
+    if not selected_channel_id:
+        return
+    dpg.show_item("export_popup")
+
+
+def export_data_submit():
+    if not selected_channel_id:
+        return
+
+    rows = dpg.get_value("export_rows_input")
+    
+    # If user cleared the field or invalid → treat as "all"
+    if rows is None or not isinstance(rows, int):
+        rows = None
+    else:
+        rows = max(1, min(rows, MAX_EXPORT_ROWS))
+
+    url = api_url(FETCH_DATA, id=selected_channel_id, results=rows if rows else "")
+
+    try:
+        resp = requests.get(url, timeout=10, stream=True)
+        resp.raise_for_status()
+
+        # Suggested filename
+        now_str = datetime.now().strftime("%Y%m%d%H%M%S")
+        default_name = f"{selected_channel_id}_{now_str}.csv"
+
+        # Ask user where to save
+        root = tk.Tk()
+        root.withdraw()  # hide main window
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=default_name,
+            title="Save exported data as..."
+        )
+        root.destroy()
+
+        if not save_path:
+            dpg.set_value("export_status", "Export cancelled")
+            dpg.configure_item("export_status", color=(220, 140, 60))
+            return
+
+        # Save content
+        with open(save_path, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        dpg.set_value("export_status", f"Saved to:\n{save_path}")
+        dpg.configure_item("export_status", color=(100, 220, 120))
+
+    except Exception as e:
+        dpg.set_value("export_status", f"Export failed:\n{str(e)}")
+        dpg.configure_item("export_status", color=(220, 70, 70))
+
+    # Auto-close after 4 seconds
+    def close_later():
+        time.sleep(4)
+        dpg.hide_item("export_popup")
+    threading.Thread(target=close_later, daemon=True).start()
 
 def sync_initial_images(cid: str):
     local_files = set(client_image_files(cid))
@@ -329,7 +424,6 @@ def poll_loop():
                         trim_oldest_files(target.parent)
                     except:
                         pass
-                # only one expected
         except:
             pass
 
@@ -337,7 +431,7 @@ def poll_loop():
 
 
 # ────────────────────────────────────────────────
-# Field display
+# Field display (unchanged)
 # ────────────────────────────────────────────────
 
 def update_fields(data):
@@ -472,6 +566,8 @@ def refresh_pressed():
         channels_data = r.json().get("channels", {})
         if selected_channel_id and selected_channel_id not in channels_data:
             close_channel()
+        cleanup_stale_channel_folders()
+        create_missing_channel_folders()
         refresh_channel_list()
     except:
         pass
@@ -495,7 +591,7 @@ def close_channel():
 
 
 # ────────────────────────────────────────────────
-# GUI (unchanged)
+# GUI
 # ────────────────────────────────────────────────
 
 dpg.create_context()
@@ -583,9 +679,13 @@ with dpg.window(label="Create Channel", modal=True, show=False, tag="create_popu
     dpg.add_input_text(label="Channel Name", default_value="My Sensor", tag="create_name", width=260)
     dpg.add_spacer(height=12)
     dpg.add_input_text(label="Field 1 Name", default_value="field1", tag="create_f1", width=260)
+    dpg.add_spacer(height=8)
     dpg.add_input_text(label="Field 2 Name", default_value="field2", tag="create_f2", width=260)
+    dpg.add_spacer(height=8)
     dpg.add_input_text(label="Field 3 Name", default_value="field3", tag="create_f3", width=260)
+    dpg.add_spacer(height=8)
     dpg.add_input_text(label="Field 4 Name", default_value="field4", tag="create_f4", width=260)
+    dpg.add_spacer(height=8)
     dpg.add_input_text(label="Field 5 Name", default_value="field5", tag="create_f5", width=260)
 
     dpg.add_spacer(height=20)
@@ -603,6 +703,20 @@ with dpg.window(label="Delete Channel", modal=True, show=False, tag="delete_popu
     dpg.add_button(label="Delete", callback=delete_channel_submit)
     dpg.add_spacer(height=8)
     dpg.add_text("", tag="delete_status")
+
+
+# ── New Export popup ───────────────────────────────────────────────
+
+with dpg.window(label="Export Data", modal=True, show=False, tag="export_popup",
+                width=340, height=180, pos=[520, 280], no_resize=True):
+
+    dpg.add_text("Export last how many rows?")
+    dpg.add_text("(leave empty = all, max 200)", color=(160,170,190))
+    dpg.add_input_int(tag="export_rows_input", default_value=200, min_value=1, max_value=MAX_EXPORT_ROWS, width=140)
+    dpg.add_spacer(height=16)
+    dpg.add_button(label="Export", callback=export_data_submit, width=120)
+    dpg.add_spacer(height=12)
+    dpg.add_text("", tag="export_status", color=(180,220,255), wrap=0)
 
 
 # ────────────────────────────────────────────────

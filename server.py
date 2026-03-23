@@ -8,7 +8,7 @@ cmd command to find IPv4 address -
 ipconfig | find "IPv4"
 
 cmd command to run server -
-uvicorn test:app --host 0.0.0.0 --port 8000
+uvicorn server:app --host 0.0.0.0 --port 8000
 
 API to list available channels -
 http://192.168.31.68:8000/channels
@@ -30,46 +30,72 @@ Interactive gui for api testing -
 http://192.168.31.68:8000/docs
 '''
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, File, Form, UploadFile
+from fastapi.responses import StreamingResponse
 import json
 import os
-from typing import List, Dict, Any
 import time
 import shutil
-from fastapi import File, Form, UploadFile
-from fastapi.responses import StreamingResponse
+import csv
+from typing import List, Dict, Any
+from collections import deque
+import threading
+from datetime import datetime
+import pytz
 
 app = FastAPI()
 
-dataFile = "channels2.json"
+DATA_DIR = "channel_data"
+MEDIA_SUBDIR = "channel_media"
+LOGS_SUBDIR = "channel_logs"
 
+dataFile = os.path.join(DATA_DIR, "channels2.json")
 imgLimit = 20
 
-#Dictionary format
-# {ch1_id : [ch1_name, [{f1_name : "name", f1_val : "val"}, {f2_name : "name", f2_val : "val"}, ..... ]]}
+# {channel_id: [name, list_of_field_dicts]}
 channels: Dict[str, List[Any]] = {}
 
+# {channel_id: deque of rows (list of values) - max 200}
+log_buffer: Dict[str, deque] = {}
+
+# Last time we flushed buffers
+last_flush_time = time.time()
+
+def ensure_directories():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, MEDIA_SUBDIR), exist_ok=True)
+    os.makedirs(os.path.join(DATA_DIR, LOGS_SUBDIR), exist_ok=True)
+
+def get_media_path(cid: str) -> str:
+    return os.path.join(DATA_DIR, MEDIA_SUBDIR, cid)
+
+def get_log_path(cid: str) -> str:
+    return os.path.join(DATA_DIR, LOGS_SUBDIR, f"{cid}.csv")
 
 def loadChannels():
-    if os.path.exists(dataFile):
-        try:
-            with open(dataFile, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-                for cid, data in raw.items():
-                    channelName = data[0]
-                    fieldsRaw = data[1]
-                    fields = []
-                    for item in fieldsRaw:
-                        fields.append({
-                            "fieldName": item["fieldName"],
-                            "value": None if item["value"] is None else float(item["value"])
-                        })
-                    channels[cid] = [channelName, fields]
-            print(f"Loaded {len(channels)} channels from {dataFile}")
-
-        except Exception as e:
-            print(f"Error loading {dataFile}: {e}. Starting empty.")
-
+    if not os.path.exists(dataFile):
+        return
+    
+    try:
+        with open(dataFile, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+            for cid, data in raw.items():
+                channelName = data[0]
+                fieldsRaw = data[1]
+                fields = []
+                for item in fieldsRaw:
+                    fields.append({
+                        "fieldName": item["fieldName"],
+                        "value": None if item["value"] is None else float(item["value"])
+                    })
+                channels[cid] = [channelName, fields]
+                
+                # Initialize buffer
+                log_buffer[cid] = deque(maxlen=200)
+                
+        print(f"Loaded {len(channels)} channels from {dataFile}")
+    except Exception as e:
+        print(f"Error loading channels: {e}")
 
 def saveChannels():
     try:
@@ -83,48 +109,71 @@ def saveChannels():
             serializable[cid] = [channelName, fieldsSer]
         with open(dataFile, "w", encoding="utf-8") as f:
             json.dump(serializable, f, indent=2)
-        print(f"Saved {len(channels)} channels to {dataFile}")
     except Exception as e:
-        print(f"Error saving {dataFile}: {e}")
-
+        print(f"Error saving channels: {e}")
 
 def trimDirectory(folder_path, n):
-    files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)]
-    files = [f for f in files if os.path.isfile(f)]
-
-    x = len(files)
-
-    if x > n:
-        files.sort(key=os.path.getmtime)  # oldest first
-        for f in files[:x - n]:
+    files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if os.path.isfile(os.path.join(folder_path, f))]
+    if len(files) > n:
+        files.sort(key=os.path.getmtime)
+        for f in files[:-n]:
             os.remove(f)
 
+def flush_logs():
+    global last_flush_time
+    now = time.time()
+    if now - last_flush_time < 10:
+        return
+    
+    for cid, buffer in log_buffer.items():
+        if not buffer:
+            continue
+            
+        log_path = get_log_path(cid)
+        file_exists = os.path.exists(log_path)
+        
+        field_names = [f["fieldName"] for f in channels[cid][1] if f["fieldName"] != "time_src"]
+        
+        with open(log_path, "a", newline="", encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            if not file_exists:
+                writer.writerow(field_names)
+            
+            for row in buffer:
+                writer.writerow(row)
+        
+        # Clear flushed items
+        buffer.clear()
+    
+    last_flush_time = now
 
-# Load data at startup
+def background_flush():
+    while True:
+        time.sleep(10)
+        flush_logs()
+
+# ────────────────────────────────────────────────
+# Startup
+# ────────────────────────────────────────────────
+
+ensure_directories()
 loadChannels()
 
-try:
-    os.mkdir("channel_media")
-except FileExistsError:
-    pass
-except FileNotFoundError:
-    pass
-
+# Start background CSV writer
+threading.Thread(target=background_flush, daemon=True).start()
 
 fname_dict = {}
 
-for channel in os.listdir("channel_media"):
-    dir_path = f"channel_media/{channel}"
-
+for channel in os.listdir(os.path.join(DATA_DIR, MEDIA_SUBDIR)):
+    dir_path = os.path.join(DATA_DIR, MEDIA_SUBDIR, channel)
     if os.path.isdir(dir_path):
-
-        files = [f for f in os.listdir(dir_path)
-                 if os.path.isfile(os.path.join(dir_path, f))]
-
+        files = [f for f in os.listdir(dir_path) if os.path.isfile(os.path.join(dir_path, f))]
         files.sort(key=lambda x: os.path.getmtime(os.path.join(dir_path, x)))
-
         fname_dict[channel] = files
 
+# ────────────────────────────────────────────────
+# Endpoints
+# ────────────────────────────────────────────────
 
 @app.get("/createChannel")
 async def createChannel(
@@ -155,13 +204,22 @@ async def createChannel(
         fields.append({"fieldName": fieldName, "value": None})
 
     channels[id] = [name.strip(), fields]
+    log_buffer[id] = deque(maxlen=200)
 
     saveChannels()
 
     try:
-        os.mkdir(f"channel_media/{id}")
-    except FileNotFoundError:
-        print("Parent directory not found!")
+        os.mkdir(get_media_path(id))
+    except FileExistsError:
+        pass
+
+    # Create empty CSV with headers
+    log_path = get_log_path(id)
+    field_names = [f["fieldName"] for f in fields if f["fieldName"] != "time_src"]
+    if not os.path.exists(log_path):
+        with open(log_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(field_names)
 
     return {
         "status": "channel created",
@@ -170,6 +228,12 @@ async def createChannel(
         "fields": [{"fieldName": f["fieldName"], "value": f["value"]} for f in fields]
     }
 
+# ... (rest of imports and code unchanged)
+
+from datetime import datetime
+import pytz
+
+# ... (rest of your imports and code remain the same)
 
 @app.get("/writeFields")
 async def writeFields(
@@ -187,15 +251,55 @@ async def writeFields(
     data = channels[id]
     fields = data[1]
 
-    updates = [field1, field2, field3, field4, field5, time_src]
-    for i, val in enumerate(updates):
-        if val is not None and i < len(fields):
-            fields[i]["value"] = val
+    # Incoming values (as received from query params)
+    incoming = [field1, field2, field3, field4, field5, time_src]
 
-    #if time_src != None:
-    fields[6]["value"] = time.time_ns()/1000000
-    
+    # Update fields (store raw-ish values, convert numbers when possible)
+    for i, incoming_val in enumerate(incoming):
+        if incoming_val is not None and i < len(fields):
+            stripped = incoming_val.strip()
+            if stripped == "":
+                fields[i]["value"] = None
+            else:
+                try:
+                    fields[i]["value"] = float(stripped)
+                except ValueError:
+                    fields[i]["value"] = stripped
+
+        # Always update the numeric timestamp (index 6 = time_src)
+    current_millis = time.time_ns() / 1000000
+    fields[6]["value"] = current_millis          # keep precise number in JSON
+
+    # Do NOT store formatted string in fields[5]
+    # fields[5]["value"] remains whatever was sent (or None)
+
     saveChannels()
+
+    # ── Logging logic ──
+    row = []
+    has_real_data = False
+
+    # field1 to field5
+    for i in range(5):
+        val = fields[i]["value"]
+        if val is None:
+            row.append("")
+        elif isinstance(val, (int, float)):
+            row.append(f"{val:g}")
+        else:
+            row.append(str(val))
+
+        if val is not None:
+            has_real_data = True
+
+    # time_des — format on the fly for CSV only
+    ist_tz = pytz.timezone('Asia/Kolkata')
+    ist_now = datetime.fromtimestamp(current_millis / 1000, tz=ist_tz)
+    time_des_str = ist_now.strftime('%Y-%m-%d-%H-%M-%S')
+    row.append(time_des_str)
+
+    if has_real_data:
+        log_buffer[id].append(row)
 
     return {
         "status": "fields updated",
@@ -203,7 +307,6 @@ async def writeFields(
         "channelName": data[0],
         "fields": [{"fieldName": f["fieldName"], "value": f["value"]} for f in fields]
     }
-
 
 @app.get("/readFields")
 async def readFields(id: str):
@@ -222,7 +325,6 @@ async def readFields(id: str):
 
     return result
 
-
 @app.get("/deleteChannel")
 async def deleteChannel(id: str):
     if id not in channels:
@@ -230,20 +332,25 @@ async def deleteChannel(id: str):
 
     channelName = channels[id][0]
     del channels[id]
+    log_buffer.pop(id, None)
 
     saveChannels()
 
     try:
-        shutil.rmtree(f"channel_media/{id}")
+        shutil.rmtree(get_media_path(id))
     except FileNotFoundError:
-        print("Deletion failed, directory not found!")
+        pass
+
+    try:
+        os.remove(get_log_path(id))
+    except FileNotFoundError:
+        pass
 
     return {
         "status": "channel deleted",
         "channelId": id,
         "channelName": channelName
     }
-
 
 @app.get("/channels")
 async def listChannels():
@@ -258,73 +365,63 @@ async def listChannels():
         }
     return {"channels": result}
 
-
 @app.get("/listImages")
-async def listImages(
-    id: str,
-    results: int = Query(None)
-    ):
+async def listImages(id: str, results: int = Query(None)):
     if id not in channels:
         raise HTTPException(404, "Channel not found!")
 
-    # path = f"channel_media/{id}"
+    media_dir = get_media_path(id)
+    if not os.path.exists(media_dir):
+        return {"channelID": id, "img_list": []}
 
-    # imgList = sorted(
-    #     [f for f in os.listdir(path) if os.path.isfile(os.path.join(path, f))],
-    #     key=lambda x: os.path.getctime(os.path.join(path, x)),
-    #     reverse=True  # True for newest first
-    # )
+    if id not in fname_dict:
+        fname_dict[id] = []
 
-    if results == None:
-        return {
-            "channelID": {id},
-            "img_list": fname_dict[id]
-        }
-    
+    if results is None:
+        return {"channelID": id, "img_list": fname_dict[id]}
     else:
-        return {
-            "channelID": {id},
-            "img_list": fname_dict[id][-results:]
-        }
-    
+        return {"channelID": id, "img_list": fname_dict[id][-results:]}
 
 @app.post("/uploadImage")
 async def uploadImage(
-        id: str = Query(None),
-        file: UploadFile = File(...),
-        filename: str = Form(...)
-    ):
+    id: str = Query(...),
+    file: UploadFile = File(...),
+    filename: str = Form(...)
+):
+    if id not in channels:
+        raise HTTPException(404, "Channel not found")
 
-    with open(f"channel_media/{id}/{filename}", "wb") as f:
+    media_dir = get_media_path(id)
+    os.makedirs(media_dir, exist_ok=True)
+
+    file_path = os.path.join(media_dir, filename)
+    with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
+    if id not in fname_dict:
+        fname_dict[id] = []
     fname_dict[id].append(filename)
-    # if len(fname_dict[id]) > imgLimit:
-    #     fname_dict[id] = fname_dict[id][-imgLimit:] # trim list of imgs
-    fname_dict[id] = fname_dict[id][-imgLimit:] # trim list of imgs
+    fname_dict[id] = fname_dict[id][-imgLimit:]
 
-    trimDirectory(f"channel_media/{id}",imgLimit)
+    trimDirectory(media_dir, imgLimit)
 
-    return {
-        "sent": filename
-    }
-
+    return {"sent": filename}
 
 @app.get("/getImages")
-async def getImages(
-        id: str = Query(...),
-        results: int = Query(1)
-    ):
+async def getImages(id: str = Query(...), results: int = Query(1)):
+    if id not in channels:
+        raise HTTPException(404, "Channel not found")
 
-    files = fname_dict[id]
-    files = files[-results:]  # newest N files
+    if id not in fname_dict:
+        fname_dict[id] = []
+
+    files = fname_dict[id][-results:]
 
     boundary = "myboundary"
 
     def generate():
         for filename in files:
-            path = f"channel_media/{id}/{filename}"
-
+            path = os.path.join(get_media_path(id), filename)
             yield f"--{boundary}\r\n"
             yield f'Content-Disposition: form-data; name="files"; filename="{filename}"\r\n'
             yield "Content-Type: application/octet-stream\r\n\r\n"
@@ -339,4 +436,39 @@ async def getImages(
     return StreamingResponse(
         generate(),
         media_type=f"multipart/form-data; boundary={boundary}"
+    )
+
+@app.get("/fetchData")
+async def fetchData(id: str = Query(...), results: int = Query(None)):
+    if id not in channels:
+        raise HTTPException(404, "Channel not found")
+
+    log_path = get_log_path(id)
+    if not os.path.exists(log_path):
+        raise HTTPException(404, "No data log found for this channel")
+
+    # Flush latest buffer first
+    flush_logs()
+
+    def generate_csv():
+        with open(log_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        if results is not None and results > 0:
+            # header + last N data rows
+            if len(lines) > 1:
+                yield lines[0]           # header
+                for line in lines[-results:]:
+                    yield line
+            else:
+                yield lines[0] if lines else ""
+        else:
+            # entire file
+            for line in lines:
+                yield line
+
+    return StreamingResponse(
+        generate_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={id}_data.csv"}
     )
