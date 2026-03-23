@@ -11,29 +11,25 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog
 
-# ────────────────────────────────────────────────
-# Config
-# ────────────────────────────────────────────────
-
-cloud_base_URL = "pravahan.api"
+cloud_base_URL = "pravahan.onrender.com"
 API_BASE_URL = ""
 
 READ_INTERVAL_SEC = 0.1
-SERVER_RETRY_INTERVAL = 5
+SERVER_RETRY_INTERVAL = 15
 KEEP_NEWEST_IMAGES = 20
 MAX_EXPORT_ROWS = 200
 
-# API path templates
-CHANNELS_LIST     = ":8000/channels"
-CHANNEL_CREATE    = ":8000/createChannel?id=[id]&name=[name]&field1=[name1]&field2=[name2]&field3=[name3]&field4=[name4]&field5=[name5]"
-CHANNEL_DELETE    = ":8000/deleteChannel?id=[id]"
-FIELDS_WRITE      = ":8000/writeFields?id=[id]"
-FIELDS_READ       = ":8000/readFields?id=[id]"
-IMAGES_LIST       = ":8000/listImages?id=[id]&results=[results]"
-IMAGES_GET        = ":8000/getImages?id=[id]&results=[results]"
-FETCH_DATA        = ":8000/fetchData?id=[id]&results=[results]"
 
-# State
+CHANNELS_LIST     = "/channels"
+CHANNEL_CREATE    = "/createChannel?id=[id]&name=[name]&field1=[name1]&field2=[name2]&field3=[name3]&field4=[name4]&field5=[name5]"
+CHANNEL_DELETE    = "/deleteChannel?id=[id]"
+FIELDS_WRITE      = "/writeFields?id=[id]"
+FIELDS_READ       = "/readFields?id=[id]"
+IMAGES_LIST       = "/listImages?id=[id]&results=[results]"
+IMAGES_GET        = "/getImages?id=[id]&results=[results]"
+FETCH_DATA        = "/fetchData?id=[id]&results=[results]"
+
+
 channels_data = {}
 selected_channel_id = None
 polling_active = False
@@ -47,9 +43,6 @@ MAX_FIELDS = 5
 CLIENT_MEDIA_DIR = Path("client_media")
 
 
-# ────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────
 
 def random_id():
     return ''.join(random.choices(string.ascii_uppercase, k=6))
@@ -59,7 +52,19 @@ def api_url(template: str, **repl) -> str:
     path = template
     for k, v in repl.items():
         path = path.replace(f"[{k}]", str(v))
-    return f"http://{API_BASE_URL}{path}"
+
+    if API_BASE_URL == cloud_base_URL:
+        # Cloud
+        return f"https://{API_BASE_URL}{path}"
+    else:
+        # Local
+        return f"http://{API_BASE_URL}:8000{path}"
+
+
+def print_api_call(url: str, action: str = "Calling"):
+    """Print API endpoint before making the request"""
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[{timestamp}] {action}: {url}")
 
 
 def ensure_channel_dir(cid: str) -> Path:
@@ -119,7 +124,6 @@ def parse_multipart(resp):
 
 
 def cleanup_stale_channel_folders():
-    """Remove client_media folders for channels that no longer exist on server"""
     if not CLIENT_MEDIA_DIR.exists():
         return
 
@@ -128,32 +132,34 @@ def cleanup_stale_channel_folders():
     for item in CLIENT_MEDIA_DIR.iterdir():
         if item.is_dir() and item.name not in known_ids:
             try:
-                # recursive delete
                 import shutil
                 shutil.rmtree(item)
-                print(f"Removed stale channel folder: {item.name}")
-            except Exception as e:
-                print(f"Failed to remove stale folder {item.name}: {e}")
+            except:
+                pass
 
 
 def create_missing_channel_folders():
-    """Create client_media/<id> folders for newly discovered channels"""
     for cid in channels_data:
         ensure_channel_dir(cid)
 
 
-# ────────────────────────────────────────────────
-# Connection
-# ────────────────────────────────────────────────
 
 def connect_server():
-    dpg.set_value("status_text", "Connecting...")
+    dpg.set_value("status_text", "Connecting... (may take 20-40s on cold start)")
     dpg.configure_item("status_text", color=(180, 180, 200))
 
+    url = api_url(CHANNELS_LIST)
+    print_api_call(url, "Connecting to server")
+
     try:
-        r = requests.get(api_url(CHANNELS_LIST), timeout=5)
+        r = requests.get(url, timeout=40, allow_redirects=True)
         r.raise_for_status()
-    except:
+    except requests.exceptions.Timeout:
+        dpg.set_value("status_text", "Timeout - Server is waking up. Try again.")
+        dpg.configure_item("status_text", color=(220, 140, 60))
+        dpg.show_item("retry_btn")
+        return
+    except Exception:
         dpg.set_value("status_text", "Server unreachable")
         dpg.configure_item("status_text", color=(220, 70, 70))
         dpg.show_item("retry_btn")
@@ -175,9 +181,6 @@ def connect_pressed():
     connect_server()
 
 
-# ────────────────────────────────────────────────
-# Dashboard & list
-# ────────────────────────────────────────────────
 
 def load_dashboard(data):
     global channels_data
@@ -209,9 +212,24 @@ def refresh_channel_list():
                 dpg.add_text(f"ID: {cid}")
 
 
-# ────────────────────────────────────────────────
-# Channel view + sync
-# ────────────────────────────────────────────────
+def get_ping_latency(host="pravahan.onrender.com"):
+    try:
+        output = subprocess.check_output(
+            ["ping", host, "-n", "4"],
+            stderr=subprocess.DEVNULL,
+            universal_newlines=True
+        )
+
+        for line in output.splitlines():
+            if "Average" in line:
+                avg = line.split("Average =")[-1].strip()
+                return float(avg.replace("ms", "").strip())
+    except:
+        pass
+
+    return None
+
+
 
 def select_channel(sender, app_data, channel_id):
     global selected_channel_id, polling_active, field_value_texts, field_label_texts
@@ -222,9 +240,8 @@ def select_channel(sender, app_data, channel_id):
 
     dpg.delete_item("right_panel", children_only=True)
 
-    base = f"http://{API_BASE_URL}"
-    read_url  = base + FIELDS_READ.replace("[id]", selected_channel_id)
-    write_url = base + FIELDS_WRITE.replace("[id]", selected_channel_id)
+    read_url  = api_url(FIELDS_READ, id=selected_channel_id)
+    write_url = api_url(FIELDS_WRITE, id=selected_channel_id)
 
     dpg.add_text("Read endpoint", color=(140,150,170), parent="right_panel")
     dpg.add_input_text(default_value=read_url, readonly=True, width=-1, parent="right_panel")
@@ -251,30 +268,47 @@ def select_channel(sender, app_data, channel_id):
         dpg.add_spacer(width=12)
         dpg.add_button(label="Export data", callback=open_export_popup)
 
-    # Latency test ...
-    latency_list = []
-    write_base = base + FIELDS_WRITE.replace("[id]", selected_channel_id)
+    # Latency Test
 
-    for _ in range(5):
-        ts = time.time_ns() / 1_000_000
-        try:
-            requests.get(f"{write_base}&time_src={ts}", timeout=None)
-        except:
-            pass
-        time.sleep(0.1)
+    if API_BASE_URL == cloud_base_URL:
+        latency = get_ping_latency(cloud_base_URL)
+        if latency is not None:
+            dpg.set_value(latency_text_tag, f"Latency (ms): {latency:.1f}")
+        else:
+            dpg.set_value(latency_text_tag, "Latency (ms): --")
 
-        try:
-            r = requests.get(read_url, timeout=4)
-            r.raise_for_status()
-            data = r.json()
-            latency_list.append(float(data.get("time_des", 0)) - float(data.get("time_src", 0)))
-        except:
-            pass
-
-    if latency_list:
-        dpg.set_value(latency_text_tag, f"Latency (ms): {min(latency_list):.2f}")
     else:
-        dpg.set_value(latency_text_tag, "Latency (ms): --")
+        latency_list = []
+        write_base = api_url(FIELDS_WRITE, id=selected_channel_id)
+
+        for _ in range(5):
+            ts = (time.time_ns() / 1_000_000) + 714
+            test_url = f"{write_base}&time_src={ts}"
+            print_api_call(test_url, "Latency test (write)")
+            try:
+                requests.get(test_url, timeout=10)
+            except:
+                pass
+            time.sleep(0.2)
+
+            print_api_call(read_url, "Latency test (read)")
+            try:
+                r = requests.get(read_url, timeout=15)
+                r.raise_for_status()
+                data = r.json()
+                time_src = float(data.get("time_src", 0))
+                time_des = float(data.get("time_des", 0))
+                if time_src > 0 and time_des > 0:
+                    latency_list.append(time_des - time_src)
+            except:
+                pass
+
+        if latency_list:
+            min_latency = min(latency_list)
+            dpg.set_value(latency_text_tag, f"Latency (ms): {min_latency:.1f}")
+        else:
+            dpg.set_value(latency_text_tag, "Latency (ms): --")
+
 
     sync_initial_images(selected_channel_id)
     start_polling()
@@ -296,26 +330,23 @@ def export_data_submit():
         return
 
     rows = dpg.get_value("export_rows_input")
-    
-    # If user cleared the field or invalid → treat as "all"
     if rows is None or not isinstance(rows, int):
         rows = None
     else:
         rows = max(1, min(rows, MAX_EXPORT_ROWS))
 
     url = api_url(FETCH_DATA, id=selected_channel_id, results=rows if rows else "")
+    print_api_call(url, "Exporting data")
 
     try:
-        resp = requests.get(url, timeout=10, stream=True)
+        resp = requests.get(url, timeout=15, stream=True)
         resp.raise_for_status()
 
-        # Suggested filename
         now_str = datetime.now().strftime("%Y%m%d%H%M%S")
         default_name = f"{selected_channel_id}_{now_str}.csv"
 
-        # Ask user where to save
         root = tk.Tk()
-        root.withdraw()  # hide main window
+        root.withdraw()
         save_path = filedialog.asksaveasfilename(
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
@@ -329,7 +360,6 @@ def export_data_submit():
             dpg.configure_item("export_status", color=(220, 140, 60))
             return
 
-        # Save content
         with open(save_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 f.write(chunk)
@@ -341,50 +371,44 @@ def export_data_submit():
         dpg.set_value("export_status", f"Export failed:\n{str(e)}")
         dpg.configure_item("export_status", color=(220, 70, 70))
 
-    # Auto-close after 4 seconds
     def close_later():
         time.sleep(4)
         dpg.hide_item("export_popup")
     threading.Thread(target=close_later, daemon=True).start()
 
+
 def sync_initial_images(cid: str):
     local_files = set(client_image_files(cid))
     dir_path = ensure_channel_dir(cid)
 
+    url = api_url(IMAGES_LIST, id=cid, results=20)
+    print_api_call(url, "Listing images")
+
     try:
-        r = requests.get(api_url(IMAGES_LIST, id=cid, results=20), timeout=8)
+        r = requests.get(url, timeout=15)
         r.raise_for_status()
         server_files = r.json().get("img_list", [])
     except:
         return
 
-    to_fetch = []
-    for fname in reversed(server_files):
-        if fname not in local_files:
-            to_fetch.append(fname)
-        else:
-            break
+    to_fetch = [fname for fname in reversed(server_files) if fname not in local_files]
 
     if not to_fetch:
         trim_oldest_files(dir_path)
         return
 
+    url = api_url(IMAGES_GET, id=cid, results=len(to_fetch))
+    print_api_call(url, "Fetching images")
+
     try:
-        resp = requests.get(api_url(IMAGES_GET, id=cid, results=len(to_fetch)), timeout=12, stream=True)
+        resp = requests.get(url, timeout=20, stream=True)
         resp.raise_for_status()
         for name, content in parse_multipart(resp):
-            try:
-                (dir_path / name).write_bytes(content)
-            except:
-                pass
+            (dir_path / name).write_bytes(content)
         trim_oldest_files(dir_path)
     except:
         pass
 
-
-# ────────────────────────────────────────────────
-# Polling loop
-# ────────────────────────────────────────────────
 
 def start_polling():
     global polling_active
@@ -395,11 +419,12 @@ def start_polling():
 def poll_loop():
     global polling_active, server_online
     last_image = None
-    base = f"http://{API_BASE_URL}"
 
     while polling_active and selected_channel_id:
         try:
-            r = requests.get(base + FIELDS_READ.replace("[id]", selected_channel_id), timeout=4)
+            read_url = api_url(FIELDS_READ, id=selected_channel_id)
+            print_api_call(read_url, "Polling fields")
+            r = requests.get(read_url, timeout=15)
             r.raise_for_status()
             update_fields(r.json())
             server_online = True
@@ -408,31 +433,27 @@ def poll_loop():
             time.sleep(SERVER_RETRY_INTERVAL)
             continue
 
-        # New image check
         try:
-            r_img = requests.get(api_url(IMAGES_LIST, id=selected_channel_id, results=1), timeout=4)
+            img_list_url = api_url(IMAGES_LIST, id=selected_channel_id, results=1)
+            print_api_call(img_list_url, "Polling image list")
+            r_img = requests.get(img_list_url, timeout=10)
             r_img.raise_for_status()
             latest = r_img.json().get("img_list", [None])[0]
             if latest and latest != last_image:
-                resp = requests.get(api_url(IMAGES_GET, id=selected_channel_id, results=1), timeout=8, stream=True)
+                img_get_url = api_url(IMAGES_GET, id=selected_channel_id, results=1)
+                print_api_call(img_get_url, "Fetching new image")
+                resp = requests.get(img_get_url, timeout=15, stream=True)
                 resp.raise_for_status()
                 for name, content in parse_multipart(resp):
                     target = CLIENT_MEDIA_DIR / selected_channel_id / name
-                    try:
-                        target.write_bytes(content)
-                        last_image = name
-                        trim_oldest_files(target.parent)
-                    except:
-                        pass
+                    target.write_bytes(content)
+                    last_image = name
+                    trim_oldest_files(target.parent)
         except:
             pass
 
         time.sleep(READ_INTERVAL_SEC)
 
-
-# ────────────────────────────────────────────────
-# Field display (unchanged)
-# ────────────────────────────────────────────────
 
 def update_fields(data):
     global field_value_texts, field_label_texts
@@ -499,10 +520,6 @@ def update_fields(data):
             dpg.set_value(ltag, "")
 
 
-# ────────────────────────────────────────────────
-# Channel CRUD & close
-# ────────────────────────────────────────────────
-
 def open_create_popup():
     dpg.show_item("create_popup")
 
@@ -518,8 +535,10 @@ def create_channel_submit():
                   name4=dpg.get_value("create_f4") or "field4",
                   name5=dpg.get_value("create_f5") or "field5")
 
+    print_api_call(url, "Creating channel")
+
     try:
-        r = requests.get(url, timeout=5)
+        r = requests.get(url, timeout=15)
         r.raise_for_status()
     except:
         dpg.set_value("create_status", "Server unreachable")
@@ -543,8 +562,11 @@ def delete_channel_submit():
         dpg.set_value("delete_status", "Enter an ID")
         return
 
+    url = api_url(CHANNEL_DELETE, id=cid)
+    print_api_call(url, "Deleting channel")
+
     try:
-        r = requests.get(api_url(CHANNEL_DELETE, id=cid), timeout=5)
+        r = requests.get(url, timeout=10)
         r.raise_for_status()
     except:
         dpg.set_value("delete_status", "Server unreachable")
@@ -560,8 +582,11 @@ def delete_channel_submit():
 
 def refresh_pressed():
     global channels_data
+    url = api_url(CHANNELS_LIST)
+    print_api_call(url, "Refreshing channel list")
+
     try:
-        r = requests.get(api_url(CHANNELS_LIST), timeout=5)
+        r = requests.get(url, timeout=20)
         r.raise_for_status()
         channels_data = r.json().get("channels", {})
         if selected_channel_id and selected_channel_id not in channels_data:
@@ -590,9 +615,7 @@ def close_channel():
             dpg.add_spacer(height=160)
 
 
-# ────────────────────────────────────────────────
 # GUI
-# ────────────────────────────────────────────────
 
 dpg.create_context()
 
@@ -624,7 +647,7 @@ with dpg.window(tag="connect_screen", width=520, height=380, pos=[340, 200],
     dpg.add_spacer(height=24)
     dpg.add_text("Pravahan", color=(90, 160, 255))
     dpg.add_spacer(height=32)
-    dpg.add_checkbox(label="Use Cloud Server (pravahan.api)", tag="cloud_toggle", default_value=True)
+    dpg.add_checkbox(label="Use Cloud Server (pravahan.onrender.com)", tag="cloud_toggle", default_value=True)
     dpg.add_spacer(height=16)
     dpg.add_text("Local server (host:port)", color=(160,170,190))
     dpg.add_input_text(tag="local_url", hint="e.g. 192.168.1.77:8000", width=320)
@@ -705,8 +728,6 @@ with dpg.window(label="Delete Channel", modal=True, show=False, tag="delete_popu
     dpg.add_text("", tag="delete_status")
 
 
-# ── New Export popup ───────────────────────────────────────────────
-
 with dpg.window(label="Export Data", modal=True, show=False, tag="export_popup",
                 width=340, height=180, pos=[520, 280], no_resize=True):
 
@@ -719,9 +740,7 @@ with dpg.window(label="Export Data", modal=True, show=False, tag="export_popup",
     dpg.add_text("", tag="export_status", color=(180,220,255), wrap=0)
 
 
-# ────────────────────────────────────────────────
-# Start
-# ────────────────────────────────────────────────
+# Main
 
 dpg.create_viewport(title="Pravahan Channel Manager", width=1200, height=780)
 dpg.setup_dearpygui()
