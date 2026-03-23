@@ -1,0 +1,5 @@
+channel_media/
+client_media
+
+*.json
+*.csv
