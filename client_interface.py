@@ -18,7 +18,7 @@ READ_INTERVAL_SEC = 0.1
 SERVER_RETRY_INTERVAL = 15
 KEEP_NEWEST_IMAGES = 20
 MAX_EXPORT_ROWS = 200
-
+ 
 
 CHANNELS_LIST     = "/channels"
 CHANNEL_CREATE    = "/createChannel?id=[id]&name=[name]&field1=[name1]&field2=[name2]&field3=[name3]&field4=[name4]&field5=[name5]"
